@@ -35,15 +35,10 @@ module Searchkick
 
       operator = options[:operator] || (options[:partial] ? "or" : "and")
 
-      # model and eagar loading
-      load = options[:load].nil? ? true : options[:load]
-      load = (options[:include] ? {include: options[:include]} : true) if load
-
       # pagination
       page = [options[:page].to_i, 1].max
       per_page = (options[:limit] || options[:per_page] || 100000).to_i
       offset = options[:offset] || (page - 1) * per_page
-      index_name = options[:index_name] || searchkick_index.name
 
       conversions_field = searchkick_options[:conversions]
       personalize_field = searchkick_options[:personalize]
@@ -278,18 +273,22 @@ module Searchkick
         end
       end
 
+      # model and eagar loading
+      load = options[:load].nil? ? true : options[:load]
+
       # An empty array will cause only the _id and _type for each hit to be returned
       # http://www.elasticsearch.org/guide/reference/api/search/fields/
       payload[:fields] = [] if load
 
-      tire_options = {load: load, size: per_page, from: offset}
       if options[:type] or klass != searchkick_klass
-        tire_options[:type] = [options[:type] || klass].flatten.map(&:document_type)
+        @type = [options[:type] || klass].flatten.map{|v| searchkick_index.klass_document_type(v) }
       end
 
-      @search = Tire::Search::Search.new(index_name, tire_options)
       @body = payload
       @facet_limits = facet_limits
+      @page = page
+      @per_page = per_page
+      @load = load
     end
 
     def searchkick_index
@@ -304,19 +303,23 @@ module Searchkick
       klass.searchkick_klass
     end
 
-    def document_type
-      klass.document_type
+    def params
+      params = {
+        index: options[:index_name] || searchkick_index.name,
+        body: body
+      }
+      params.merge!(type: @type) if @type
+      params
     end
 
     def execute
-      @search.options[:payload] = body
       begin
-        response = @search.json
-      rescue Tire::Search::SearchRequestFailed => e
-        status_code = e.message[0..3].to_i
+        response = Searchkick.client.search(params)
+      rescue => e # TODO rescue type
+        status_code = e.message[1..3].to_i
         if status_code == 404
           raise "Index missing - run #{searchkick_klass.name}.reindex"
-        elsif status_code == 500 and (e.message.include?("IllegalArgumentException[minimumSimilarity >= 1]") or e.message.include?("No query registered for [multi_match]"))
+        elsif status_code == 500 and (e.message.include?("IllegalArgumentException[minimumSimilarity >= 1]") or e.message.include?("No query registered for [multi_match]") or e.message.include?("[match] query does not support [cutoff_frequency]]"))
           raise "Upgrade Elasticsearch to 0.90.0 or greater"
         else
           raise e
@@ -332,7 +335,13 @@ module Searchkick
         response["facets"][field]["other"] = facet["total"] - facet["terms"].sum{|term| term["count"] }
       end
 
-      Searchkick::Results.new(response, @search.options.merge(term: term, model_name: searchkick_klass.model_name))
+      opts = {
+        page: @page,
+        per_page: @per_page,
+        load: @load,
+        includes: options[:include] || options[:includes]
+      }
+      Searchkick::Results.new(searchkick_klass, response, opts)
     end
 
     private
